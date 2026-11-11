@@ -1,0 +1,13 @@
+# Reference config if running host-level `cloudflared` instead of Docker profile `tunnel`.
+# With token-managed Zero Trust tunnels, set Public Hostname -> http://api:8080 (Docker)
+# or http://127.0.0.1:8080 (host cloudflared) directly in the Cloudflare dashboard.
+tunnel: <YOUR-TUNNEL-UUID>
+credentials-file: /etc/cloudflared/<YOUR-TUNNEL-UUID>.json
+
+ingress:
+  - hostname: api.example.com
+    service: http://127.0.0.1:8080
+    originRequest:
+      connectTimeout: 5s
+      noTLSVerify: false
+  - service: http_status:404

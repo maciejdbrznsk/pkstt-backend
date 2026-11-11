@@ -1,0 +1,22 @@
+# Environment & secrets
+.env
+*.env
+!.env.example
+
+# Binaries & build artifacts
+/bin/
+/pkstt-api
+*.exe
+*.test
+*.out
+
+# Downloaded transit test files
+*.zip
+*.pb
+*.bak
+
+# IDE & OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

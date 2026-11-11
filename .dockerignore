@@ -1,0 +1,8 @@
+.git
+.gitignore
+.env
+deploy
+README.md
+*.zip
+*.pb
+*.md
