@@ -96,16 +96,17 @@ type FeedStatus struct {
 }
 
 type feedSnapshot struct {
-	vehicles    []Vehicle
-	tripUpdates map[string]TripUpdate // keyed by raw trip_id
-	alerts      []Alert
-	etag        string
-	lastMod     string
-	hash        string
-	checkedAt   time.Time
-	updatedAt   time.Time
-	feedTS      time.Time
-	lastError   string
+	vehicles       []Vehicle
+	vehiclesByTrip map[string]Vehicle    // keyed by raw trip_id
+	tripUpdates    map[string]TripUpdate // keyed by raw trip_id
+	alerts         []Alert
+	etag           string
+	lastMod        string
+	hash           string
+	checkedAt      time.Time
+	updatedAt      time.Time
+	feedTS         time.Time
+	lastError      string
 }
 
 // Store keeps thread-safe in-memory GTFS-RT snapshots for ZTM and PKS, plus static TripMeta for enrichment.
@@ -201,8 +202,13 @@ func (s *Store) ApplyFeed(feed string, msg *gtfs.FeedMessage, etag, lastMod stri
 	}
 
 	vehicles := make([]Vehicle, 0, len(rawVehicles))
+	vehiclesByTrip := make(map[string]Vehicle, len(rawVehicles))
 	for _, v := range rawVehicles {
-		vehicles = append(vehicles, buildVehicle(feed, v, tripUpdates, meta, feedTS))
+		built := buildVehicle(feed, v, tripUpdates, meta, feedTS)
+		vehicles = append(vehicles, built)
+		if rawTID := strings.TrimSpace(v.GetTrip().GetTripId()); rawTID != "" {
+			vehiclesByTrip[rawTID] = built
+		}
 	}
 	sort.Slice(vehicles, func(i, j int) bool { return vehicles[i].ID < vehicles[j].ID })
 
@@ -213,16 +219,17 @@ func (s *Store) ApplyFeed(feed string, msg *gtfs.FeedMessage, etag, lastMod stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.feeds[feed] = &feedSnapshot{
-		vehicles:    vehicles,
-		tripUpdates: tripUpdates,
-		alerts:      alerts,
-		etag:        etag,
-		lastMod:     lastMod,
-		hash:        snapHash,
-		checkedAt:   now,
-		updatedAt:   now,
-		feedTS:      feedTS,
-		lastError:   "",
+		vehicles:       vehicles,
+		vehiclesByTrip: vehiclesByTrip,
+		tripUpdates:    tripUpdates,
+		alerts:         alerts,
+		etag:           etag,
+		lastMod:        lastMod,
+		hash:           snapHash,
+		checkedAt:      now,
+		updatedAt:      now,
+		feedTS:         feedTS,
+		lastError:      "",
 	}
 	s.recomputeVersionLocked()
 }
@@ -344,12 +351,29 @@ func (s *Store) Status(now time.Time) []FeedStatus {
 
 // DepartureEstimate contains live delay/cancellation info for a scheduled stop call.
 type DepartureEstimate struct {
-	EstimatedTime time.Time
-	DelaySeconds  *int
-	IsRealtime    bool
-	Canceled      bool
-	Skipped       bool
-	VehicleID     string
+	EstimatedTime   time.Time
+	DelaySeconds    *int
+	IsRealtime      bool
+	HasLiveLocation bool
+	Canceled        bool
+	Skipped         bool
+	VehicleID       string
+}
+
+// VehicleByTrip returns the active live GPS vehicle for a canonical (feed, rawTripID), if available and fresh.
+func (s *Store) VehicleByTrip(feed, rawTripID string, now time.Time) *Vehicle {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snap, ok := s.feeds[feed]
+	if !ok || now.Sub(snap.updatedAt) > maxRTFeedAge {
+		return nil
+	}
+	v, ok := snap.vehiclesByTrip[rawTripID]
+	if !ok {
+		return nil
+	}
+	cp := v
+	return &cp
 }
 
 // EstimateDeparture applies GTFS-RT TripUpdate delay propagation for a scheduled stop arrival/departure.
@@ -362,15 +386,21 @@ func (s *Store) EstimateDeparture(feed, rawTripID string, stopSeq int, rawStopID
 		s.mu.RUnlock()
 		return res
 	}
+	veh, hasVeh := snap.vehiclesByTrip[rawTripID]
 	tu, hasTU := snap.tripUpdates[rawTripID]
 	s.mu.RUnlock()
+
+	if hasVeh {
+		res.HasLiveLocation = true
+		res.VehicleID = veh.ID
+	}
 
 	if !hasTU {
 		return res
 	}
 
 	res.IsRealtime = true
-	if tu.VehicleID != "" {
+	if res.VehicleID == "" && tu.VehicleID != "" {
 		res.VehicleID = feed + ":" + tu.VehicleID
 	}
 	if tu.Canceled {

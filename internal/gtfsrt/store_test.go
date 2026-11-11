@@ -99,4 +99,45 @@ func TestStoreEnrichmentAndDelayPropagation(t *testing.T) {
 	if estStale.IsRealtime {
 		t.Fatalf("expected stale feed to fall back to scheduled, got %+v", estStale)
 	}
+
+	// VehicleByTrip and HasLiveLocation verification.
+	if !est22.HasLiveLocation || est22.VehicleID != "ztm:100" {
+		t.Fatalf("expected HasLiveLocation=true and VehicleID=ztm:100, got %+v", est22)
+	}
+	byTrip := store.VehicleByTrip("ztm", "226412", now.Add(30*time.Second))
+	if byTrip == nil || byTrip.ID != "ztm:100" || byTrip.VehicleID != "100" {
+		t.Fatalf("expected VehicleByTrip to return vehicle ztm:100, got %+v", byTrip)
+	}
+	if missing := store.VehicleByTrip("ztm", "unknown-trip", now.Add(30*time.Second)); missing != nil {
+		t.Fatalf("expected nil for unknown trip, got %+v", missing)
+	}
+	if staleVeh := store.VehicleByTrip("ztm", "226412", now.Add(15*time.Minute)); staleVeh != nil {
+		t.Fatalf("expected nil vehicle when RT feed is stale, got %+v", staleVeh)
+	}
+
+	// TripUpdate without VehiclePosition should yield HasLiveLocation == false.
+	store.ApplyFeed("pks", &gtfs.FeedMessage{
+		Header: &gtfs.FeedHeader{
+			GtfsRealtimeVersion: proto.String("2.0"),
+			Timestamp:           &ts,
+		},
+		Entity: []*gtfs.FeedEntity{
+			{
+				Id: proto.String("tu-pks"),
+				TripUpdate: &gtfs.TripUpdate{
+					Trip: &gtfs.TripDescriptor{TripId: proto.String("PKS1")},
+					StopTimeUpdate: []*gtfs.TripUpdate_StopTimeUpdate{
+						{
+							StopSequence: proto.Uint32(1),
+							Departure:    &gtfs.TripUpdate_StopTimeEvent{Delay: proto.Int32(60)},
+						},
+					},
+				},
+			},
+		},
+	}, "", "", now)
+	estPKS := store.EstimateDeparture("pks", "PKS1", 3, "199", sched, now.Add(30*time.Second))
+	if !estPKS.IsRealtime || estPKS.HasLiveLocation {
+		t.Fatalf("expected IsRealtime=true and HasLiveLocation=false without GPS vehicle, got %+v", estPKS)
+	}
 }

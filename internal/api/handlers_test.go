@@ -128,3 +128,119 @@ func TestVehiclesEndpointETagAndSecurityHeaders(t *testing.T) {
 		t.Fatalf("expected 400 Bad Request for malformed stopID, got %d", recBad.Code)
 	}
 }
+
+func TestBuildBaysMergesSharedPlatformAndPreservesDistinctNumbers(t *testing.T) {
+	platforms := []platformDTO{
+		{
+			ID:           "ztm:65",
+			Operator:     "ztm",
+			Name:         "Marszałkowska 01",
+			PlatformCode: "01",
+			Lat:          50.04100,
+			Lon:          22.00100,
+			SampleDirections: []sampleDirectionDTO{
+				{Operator: "ztm", RouteID: "ztm:18", RouteShortName: "18", Headsign: "Łukasiewicza", TripCount: 40},
+			},
+		},
+		{
+			ID:           "pks:199",
+			Operator:     "pks",
+			Name:         "Marszałkowska 01",
+			PlatformCode: "01",
+			Lat:          50.04108,
+			Lon:          22.00105,
+			SampleDirections: []sampleDirectionDTO{
+				{Operator: "pks", RouteID: "pks:202", RouteShortName: "202", Headsign: "Tyczyn", TripCount: 15},
+			},
+		},
+		{
+			ID:           "ztm:66",
+			Operator:     "ztm",
+			Name:         "Marszałkowska 02",
+			PlatformCode: "02",
+			Lat:          50.04120,
+			Lon:          22.00130,
+			SampleDirections: []sampleDirectionDTO{
+				{Operator: "ztm", RouteID: "ztm:18", RouteShortName: "18", Headsign: "Obr. Poczty Gdańskiej", TripCount: 38},
+			},
+		},
+		{
+			ID:           "pks:205",
+			Operator:     "pks",
+			Name:         "Marszałkowska 03",
+			PlatformCode: "03",
+			Lat:          50.04145,
+			Lon:          22.00150,
+			SampleDirections: []sampleDirectionDTO{
+				{Operator: "pks", RouteID: "pks:202", RouteShortName: "202", Headsign: "Rzeszów DA", TripCount: 22},
+			},
+		},
+	}
+
+	bays := buildBays("Marszałkowska", platforms)
+	if len(bays) != 3 {
+		t.Fatalf("expected 3 bays (01 merged + 02 + 03), got %d: %+v", len(bays), bays)
+	}
+	if bays[0].BayID != "01" || len(bays[0].StopIDs) != 2 || len(bays[0].Operators) != 2 {
+		t.Fatalf("expected merged bay 01 with 2 stop_ids and 2 operators, got %+v", bays[0])
+	}
+	if bays[1].BayID != "02" || bays[2].BayID != "03" {
+		t.Fatalf("expected bays 02 and 03 distinct, got %+v, %+v", bays[1], bays[2])
+	}
+}
+
+func TestBuildRouteTimetableDaysAndLegend(t *testing.T) {
+	deps := []rawTimetableDep{
+		{TripID: "ztm:t1", ServiceID: "PS", Headsign: "Lwowska Szpital", DestStopName: "Lwowska Szpital", DepartureSecs: 6*3600 + 15*60, WheelchairAccessible: true},
+		{TripID: "ztm:t2", ServiceID: "PS", Headsign: "Lwowska Szpital", DestStopName: "Lwowska Szpital", DepartureSecs: 7*3600 + 30*60, WheelchairAccessible: true},
+		{TripID: "ztm:t3", ServiceID: "PS", Headsign: "Baligrodzka", DestStopName: "Baligrodzka", DepartureSecs: 24*3600 + 10*60},
+		{TripID: "ztm:t4", ServiceID: "PW", Headsign: "Lwowska Szpital", DestStopName: "Lwowska Szpital", DepartureSecs: 8 * 3600},
+		{TripID: "ztm:t5", ServiceID: "SS", Headsign: "Lwowska Szpital", DestStopName: "Lwowska Szpital", DepartureSecs: 9*3600 + 5*60},
+	}
+
+	days, legend := buildRouteTimetableDays(deps, map[string]bool{"PS": true})
+	if len(days) != 3 {
+		t.Fatalf("expected 3 service day types (PS, PW, SS), got %d", len(days))
+	}
+	if days[0].ServiceID != "PS" || !days[0].ActiveToday || days[1].ServiceID != "PW" || days[2].ServiceID != "SS" {
+		t.Fatalf("unexpected day ordering or active flags: %+v", days)
+	}
+	if len(days[0].Hours) != 3 {
+		t.Fatalf("expected 3 hour rows for PS, got %d", len(days[0].Hours))
+	}
+	postMidnight := days[0].Hours[2]
+	if postMidnight.Hour != 24 || postMidnight.DisplayHour != 0 || postMidnight.Departures[0].Minute != 10 {
+		t.Fatalf("unexpected post-midnight row: %+v", postMidnight)
+	}
+	if postMidnight.Departures[0].VariantCode != "A" {
+		t.Fatalf("expected secondary variant code A, got %q", postMidnight.Departures[0].VariantCode)
+	}
+	if days[0].Hours[0].Departures[0].VariantCode != "" {
+		t.Fatalf("expected primary variant to have empty code, got %q", days[0].Hours[0].Departures[0].VariantCode)
+	}
+	if len(legend) != 1 || legend[0].Code != "A" {
+		t.Fatalf("expected 1 legend entry for code A, got %+v", legend)
+	}
+}
+
+func TestParseCanonicalIDHandlesEncodedColon(t *testing.T) {
+	cases := []struct {
+		in      string
+		wantF   string
+		wantID  string
+		wantOK  bool
+	}{
+		{"ztm:18", "ztm", "18", true},
+		{"ztm%3A18", "ztm", "18", true},
+		{"pks%3A202", "pks", "202", true},
+		{"ztm:225838", "ztm", "225838", true},
+		{"invalid", "", "", false},
+		{"other:18", "", "", false},
+	}
+	for _, tc := range cases {
+		f, id, ok := parseCanonicalID(tc.in)
+		if f != tc.wantF || id != tc.wantID || ok != tc.wantOK {
+			t.Fatalf("parseCanonicalID(%q) = (%q,%q,%v), want (%q,%q,%v)", tc.in, f, id, ok, tc.wantF, tc.wantID, tc.wantOK)
+		}
+	}
+}

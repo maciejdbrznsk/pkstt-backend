@@ -42,6 +42,7 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, rtStore *gtfsrt.Store, lim
 		v1.Get("/stops/{stopID}/departures", h.GetStopDepartures)
 		v1.Get("/routes", h.ListRoutes)
 		v1.Get("/routes/{routeID}", h.GetRoute)
+		v1.Get("/routes/{routeID}/timetable", h.GetRouteTimetable)
 		v1.Get("/trips/{tripID}", h.GetTrip)
 		v1.Get("/shapes/{shapeID}", h.GetShape)
 		v1.Get("/vehicles", h.ListVehicles)

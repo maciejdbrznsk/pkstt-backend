@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,18 +33,40 @@ type Handler struct {
 	cfg     config.Config
 }
 
+type sampleDirectionDTO struct {
+	Operator       string `json:"operator"`
+	RouteID        string `json:"route_id"`
+	RouteShortName string `json:"route_short_name"`
+	RouteColor     string `json:"route_color,omitempty"`
+	Headsign       string `json:"headsign"`
+	TripCount      int    `json:"trip_count"`
+}
+
 type platformDTO struct {
-	ID           string  `json:"id"`
-	Operator     string  `json:"operator"`
-	Name         string  `json:"name"`
-	Code         string  `json:"code,omitempty"`
-	PlatformCode string  `json:"platform_code,omitempty"`
-	IsOnDemand   bool    `json:"is_on_demand"`
-	Lat          float64 `json:"lat"`
-	Lon          float64 `json:"lon"`
-	ZoneID       string  `json:"zone_id,omitempty"`
-	StreetName   string  `json:"street_name,omitempty"`
-	TownName     string  `json:"town_name,omitempty"`
+	ID               string               `json:"id"`
+	Operator         string               `json:"operator"`
+	Name             string               `json:"name"`
+	Code             string               `json:"code,omitempty"`
+	PlatformCode     string               `json:"platform_code,omitempty"`
+	IsOnDemand       bool                 `json:"is_on_demand"`
+	Lat              float64              `json:"lat"`
+	Lon              float64              `json:"lon"`
+	ZoneID           string               `json:"zone_id,omitempty"`
+	StreetName       string               `json:"street_name,omitempty"`
+	TownName         string               `json:"town_name,omitempty"`
+	SampleDirections []sampleDirectionDTO `json:"sample_directions,omitempty"`
+}
+
+type bayDTO struct {
+	BayID            string               `json:"bay_id"`
+	Label            string               `json:"label"`
+	PlatformCode     string               `json:"platform_code,omitempty"`
+	Operators        []string             `json:"operators"`
+	StopIDs          []string             `json:"stop_ids"`
+	IsOnDemand       bool                 `json:"is_on_demand"`
+	Lat              float64              `json:"lat"`
+	Lon              float64              `json:"lon"`
+	SampleDirections []sampleDirectionDTO `json:"sample_directions"`
 }
 
 type stopGroupDTO struct {
@@ -77,6 +100,7 @@ type departureDTO struct {
 	RouteColor           string    `json:"route_color,omitempty"`
 	RouteTextColor       string    `json:"route_text_color,omitempty"`
 	TripID               string    `json:"trip_id"`
+	ServiceDate          string    `json:"service_date"`
 	Headsign             string    `json:"headsign"`
 	Brigade              string    `json:"brigade,omitempty"`
 	WheelchairAccessible bool      `json:"wheelchair_accessible"`
@@ -84,6 +108,7 @@ type departureDTO struct {
 	EstimatedTime        time.Time `json:"estimated_time"`
 	DelaySeconds         *int      `json:"delay_seconds"`
 	IsRealtime           bool      `json:"is_realtime"`
+	HasLiveLocation      bool      `json:"has_live_location"`
 	Canceled             bool      `json:"canceled"`
 	MinutesUntil         int       `json:"minutes_until"`
 	VehicleID            string    `json:"vehicle_id,omitempty"`
@@ -179,7 +204,8 @@ func (h *Handler) ListStopGroups(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "operator must be 'ztm' or 'pks'")
 		return
 	}
-	limit := parseIntClamped(r.URL.Query().Get("limit"), 20, 1, 100)
+	limit := parseIntClamped(r.URL.Query().Get("limit"), 20, 1, 2000)
+	offset := parseIntClamped(r.URL.Query().Get("offset"), 0, 0, 10000)
 
 	latStr := strings.TrimSpace(r.URL.Query().Get("lat"))
 	lonStr := strings.TrimSpace(r.URL.Query().Get("lon"))
@@ -225,7 +251,7 @@ func (h *Handler) ListStopGroups(w http.ResponseWriter, r *http.Request) {
 	if hasCoords {
 		groups, groupIDs, err = h.queryNearbyStopGroups(ctx, lat, lon, radius, q, op, limit)
 	} else {
-		groups, groupIDs, err = h.querySearchStopGroups(ctx, q, op, limit)
+		groups, groupIDs, err = h.querySearchStopGroups(ctx, q, op, limit, offset)
 	}
 	if err != nil {
 		h.internalErr(w, "query stop groups", err)
@@ -294,7 +320,7 @@ func (h *Handler) queryNearbyStopGroups(ctx context.Context, lat, lon, radius fl
 	return groups, ids, rows.Err()
 }
 
-func (h *Handler) querySearchStopGroups(ctx context.Context, q, op string, limit int) ([]stopGroupDTO, []string, error) {
+func (h *Handler) querySearchStopGroups(ctx context.Context, q, op string, limit, offset int) ([]stopGroupDTO, []string, error) {
 	foldedQ := gtfsstatic.FoldPolish(q)
 
 	var (
@@ -307,8 +333,8 @@ func (h *Handler) querySearchStopGroups(ctx context.Context, q, op string, limit
 			FROM stop_groups
 			WHERE ($1 = '' OR $1 = ANY(operators))
 			ORDER BY name ASC
-			LIMIT $2
-		`, op, limit)
+			LIMIT $2 OFFSET $3
+		`, op, limit, offset)
 	} else {
 		rows, err = h.pool.Query(ctx, `
 			SELECT group_id, name, operators, lat, lon, stop_count
@@ -322,8 +348,8 @@ func (h *Handler) querySearchStopGroups(ctx context.Context, q, op string, limit
 				similarity(search_text, $1) DESC,
 				array_length(operators, 1) DESC,
 				name ASC
-			LIMIT $3
-		`, foldedQ, op, limit)
+			LIMIT $3 OFFSET $4
+		`, foldedQ, op, limit, offset)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -420,6 +446,12 @@ func (h *Handler) GetStopGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := h.attachSampleDirections(ctx, groups[0].Platforms, groupID); err != nil {
+		h.internalErr(w, "query stop_group sample directions", err)
+		return
+	}
+	bays := buildBays(groups[0].Name, groups[0].Platforms)
+
 	routeRows, err := h.pool.Query(ctx, `
 		SELECT DISTINCT r.feed, r.route_id, r.route_short_name, COALESCE(r.route_long_name, ''),
 		       r.route_type, COALESCE(r.route_color, ''), COALESCE(r.route_text_color, '')
@@ -455,8 +487,155 @@ func (h *Handler) GetStopGroup(w http.ResponseWriter, r *http.Request) {
 	setCacheControl(w, 120)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"stop_group": groups[0],
+		"bays":       bays,
 		"routes":     routes,
 	})
+}
+
+func (h *Handler) attachSampleDirections(ctx context.Context, platforms []platformDTO, groupID string) error {
+	if len(platforms) == 0 {
+		return nil
+	}
+	rows, err := h.pool.Query(ctx, `
+		SELECT st.feed, st.stop_id, r.route_id, r.route_short_name, COALESCE(r.route_color, ''),
+		       COALESCE(NULLIF(t.trip_headsign, ''), r.route_long_name, '') AS headsign,
+		       COUNT(*) AS trip_cnt
+		FROM stops s
+		JOIN stop_times st ON st.feed = s.feed AND st.stop_id = s.stop_id
+		JOIN trips t ON t.feed = st.feed AND t.trip_id = st.trip_id
+		JOIN routes r ON r.feed = t.feed AND r.route_id = t.route_id
+		WHERE s.group_id = $1
+		  AND st.pickup_type <> 1
+		  AND EXISTS (
+		      SELECT 1 FROM stop_times nx
+		      WHERE nx.feed = st.feed AND nx.trip_id = st.trip_id AND nx.stop_sequence > st.stop_sequence
+		  )
+		GROUP BY st.feed, st.stop_id, r.route_id, r.route_short_name, r.route_color, headsign
+		ORDER BY trip_cnt DESC, r.route_short_name ASC
+	`, groupID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	byStop := make(map[string][]sampleDirectionDTO, len(platforms))
+	for rows.Next() {
+		var feed, rawSID, rawRID string
+		var sd sampleDirectionDTO
+		if err := rows.Scan(&feed, &rawSID, &rawRID, &sd.RouteShortName, &sd.RouteColor, &sd.Headsign, &sd.TripCount); err != nil {
+			return err
+		}
+		sd.Operator = feed
+		sd.RouteID = feed + ":" + rawRID
+		key := feed + ":" + rawSID
+		byStop[key] = append(byStop[key], sd)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := range platforms {
+		if list, ok := byStop[platforms[i].ID]; ok {
+			platforms[i].SampleDirections = list
+		}
+	}
+	return nil
+}
+
+func buildBays(groupName string, platforms []platformDTO) []bayDTO {
+	type bayAcc struct {
+		bay         bayDTO
+		hasZTM      bool
+		hasPKS      bool
+		dirDedupMap map[string]sampleDirectionDTO
+	}
+	var accs []*bayAcc
+
+	for _, p := range platforms {
+		var target *bayAcc
+		for _, a := range accs {
+			sameCode := p.PlatformCode != "" && a.bay.PlatformCode == p.PlatformCode
+			closeEnough := gtfsstatic.HaversineMeters(a.bay.Lat, a.bay.Lon, p.Lat, p.Lon) <= 45.0
+			if (sameCode && closeEnough) || (p.PlatformCode == "" && a.bay.PlatformCode == "" && gtfsstatic.HaversineMeters(a.bay.Lat, a.bay.Lon, p.Lat, p.Lon) <= 20.0) {
+				target = a
+				break
+			}
+		}
+		if target == nil {
+			bayID := p.ID
+			label := p.Name
+			if p.PlatformCode != "" {
+				bayID = p.PlatformCode
+				label = groupName + " " + p.PlatformCode
+			}
+			target = &bayAcc{
+				bay: bayDTO{
+					BayID:        bayID,
+					Label:        label,
+					PlatformCode: p.PlatformCode,
+					Lat:          p.Lat,
+					Lon:          p.Lon,
+				},
+				dirDedupMap: make(map[string]sampleDirectionDTO),
+			}
+			accs = append(accs, target)
+		} else {
+			n := float64(len(target.bay.StopIDs))
+			target.bay.Lat = (target.bay.Lat*n + p.Lat) / (n + 1)
+			target.bay.Lon = (target.bay.Lon*n + p.Lon) / (n + 1)
+		}
+
+		target.bay.StopIDs = append(target.bay.StopIDs, p.ID)
+		if p.IsOnDemand {
+			target.bay.IsOnDemand = true
+		}
+		if p.Operator == "ztm" {
+			target.hasZTM = true
+		} else if p.Operator == "pks" {
+			target.hasPKS = true
+		}
+		for _, d := range p.SampleDirections {
+			k := d.Operator + "|" + d.RouteShortName + "|" + d.Headsign
+			if existing, ok := target.dirDedupMap[k]; ok {
+				existing.TripCount += d.TripCount
+				target.dirDedupMap[k] = existing
+			} else {
+				target.dirDedupMap[k] = d
+			}
+		}
+	}
+
+	bays := make([]bayDTO, 0, len(accs))
+	for _, a := range accs {
+		if a.hasZTM {
+			a.bay.Operators = append(a.bay.Operators, "ztm")
+		}
+		if a.hasPKS {
+			a.bay.Operators = append(a.bay.Operators, "pks")
+		}
+		dirs := make([]sampleDirectionDTO, 0, len(a.dirDedupMap))
+		for _, d := range a.dirDedupMap {
+			dirs = append(dirs, d)
+		}
+		sort.Slice(dirs, func(i, j int) bool {
+			if dirs[i].TripCount != dirs[j].TripCount {
+				return dirs[i].TripCount > dirs[j].TripCount
+			}
+			return dirs[i].RouteShortName < dirs[j].RouteShortName
+		})
+		if len(dirs) > 6 {
+			dirs = dirs[:6]
+		}
+		a.bay.SampleDirections = dirs
+		bays = append(bays, a.bay)
+	}
+
+	sort.Slice(bays, func(i, j int) bool {
+		if bays[i].PlatformCode != bays[j].PlatformCode {
+			return bays[i].PlatformCode < bays[j].PlatformCode
+		}
+		return bays[i].Label < bays[j].Label
+	})
+	return bays
 }
 
 // GetStopGroupDepartures returns merged live+scheduled ZTM and PKS departures for a stop group.
@@ -488,12 +667,29 @@ func (h *Handler) GetStopGroupDepartures(w http.ResponseWriter, r *http.Request)
 	}
 	defer rows.Close()
 
+	var allowedStopSet map[string]struct{}
+	if rawStopIDs := strings.TrimSpace(r.URL.Query().Get("stop_ids")); rawStopIDs != "" {
+		allowedStopSet = make(map[string]struct{})
+		for _, tok := range strings.Split(rawStopIDs, ",") {
+			if _, _, ok := parseCanonicalID(tok); !ok {
+				writeError(w, http.StatusBadRequest, "stop_ids must contain comma-separated '<operator>:<id>' values")
+				return
+			}
+			allowedStopSet[strings.TrimSpace(tok)] = struct{}{}
+		}
+	}
+
 	var feeds, stopIDs []string
 	for rows.Next() {
 		var f, sid string
 		if err := rows.Scan(&f, &sid); err != nil {
 			h.internalErr(w, "scan group stops", err)
 			return
+		}
+		if allowedStopSet != nil {
+			if _, ok := allowedStopSet[f+":"+sid]; !ok {
+				continue
+			}
 		}
 		feeds = append(feeds, f)
 		stopIDs = append(stopIDs, sid)
@@ -691,7 +887,8 @@ func (h *Handler) queryDepartures(
 			return nil, err
 		}
 
-		origin, ok := originByDate[svcDate.Format("2006-01-02")]
+		svcDateStr := svcDate.Format("2006-01-02")
+		origin, ok := originByDate[svcDateStr]
 		if !ok {
 			continue
 		}
@@ -715,6 +912,7 @@ func (h *Handler) queryDepartures(
 			RouteColor:           routeColor,
 			RouteTextColor:       routeTextColor,
 			TripID:               feed + ":" + rawTripID,
+			ServiceDate:          svcDateStr,
 			Headsign:             headsign,
 			Brigade:              brigade,
 			WheelchairAccessible: wheelchair == 1,
@@ -722,6 +920,7 @@ func (h *Handler) queryDepartures(
 			EstimatedTime:        est.EstimatedTime,
 			DelaySeconds:         est.DelaySeconds,
 			IsRealtime:           est.IsRealtime,
+			HasLiveLocation:      est.HasLiveLocation,
 			Canceled:             est.Canceled,
 			MinutesUntil:         minsUntil,
 			VehicleID:            est.VehicleID,
@@ -794,6 +993,24 @@ func (h *Handler) ListRoutes(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) fetchRouteSummary(ctx context.Context, feed, rawID string) (routeSummaryDTO, bool, error) {
+	var rt routeSummaryDTO
+	err := h.pool.QueryRow(ctx, `
+		SELECT feed, route_short_name, COALESCE(route_long_name, ''),
+		       route_type, COALESCE(route_color, ''), COALESCE(route_text_color, '')
+		FROM routes
+		WHERE feed = $1 AND route_id = $2
+	`, feed, rawID).Scan(&rt.Operator, &rt.ShortName, &rt.LongName, &rt.RouteType, &rt.Color, &rt.TextColor)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return rt, false, nil
+	}
+	if err != nil {
+		return rt, false, err
+	}
+	rt.ID = feed + ":" + rawID
+	return rt, true, nil
+}
+
 // GetRoute returns route metadata and representative variants/stop sequences per direction.
 func (h *Handler) GetRoute(w http.ResponseWriter, r *http.Request) {
 	rawParam := chi.URLParam(r, "routeID")
@@ -806,22 +1023,15 @@ func (h *Handler) GetRoute(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	var rt routeSummaryDTO
-	err := h.pool.QueryRow(ctx, `
-		SELECT feed, route_short_name, COALESCE(route_long_name, ''),
-		       route_type, COALESCE(route_color, ''), COALESCE(route_text_color, '')
-		FROM routes
-		WHERE feed = $1 AND route_id = $2
-	`, feed, rawID).Scan(&rt.Operator, &rt.ShortName, &rt.LongName, &rt.RouteType, &rt.Color, &rt.TextColor)
-	if errors.Is(err, pgx.ErrNoRows) {
-		writeError(w, http.StatusNotFound, "route not found")
-		return
-	}
+	rt, found, err := h.fetchRouteSummary(ctx, feed, rawID)
 	if err != nil {
 		h.internalErr(w, "get route", err)
 		return
 	}
-	rt.ID = rawParam
+	if !found {
+		writeError(w, http.StatusNotFound, "route not found")
+		return
+	}
 
 	// Pick the trip with the most stops for each (direction_id, trip_headsign) as representative variant.
 	varRows, err := h.pool.Query(ctx, `
@@ -936,6 +1146,517 @@ func (h *Handler) GetRoute(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type routeDirectionDTO struct {
+	DirectionID      int      `json:"direction_id"`
+	Headsign         string   `json:"headsign"`
+	VariantHeadsigns []string `json:"variant_headsigns,omitempty"`
+	TripCount        int      `json:"trip_count"`
+}
+
+type timetableRouteStopDTO struct {
+	StopSequence int     `json:"stop_sequence"`
+	StopID       string  `json:"stop_id"`
+	GroupID      string  `json:"group_id"`
+	Name         string  `json:"name"`
+	PlatformCode string  `json:"platform_code,omitempty"`
+	IsOnDemand   bool    `json:"is_on_demand"`
+	IsTerminus   bool    `json:"is_terminus"`
+	Lat          float64 `json:"lat"`
+	Lon          float64 `json:"lon"`
+}
+
+type timetableEntryDTO struct {
+	TripID               string `json:"trip_id"`
+	Hour                 int    `json:"hour"`
+	DisplayHour          int    `json:"display_hour"`
+	Minute               int    `json:"minute"`
+	Time                 string `json:"time"`
+	VariantCode          string `json:"variant_code,omitempty"`
+	Headsign             string `json:"headsign"`
+	WheelchairAccessible bool   `json:"wheelchair_accessible"`
+}
+
+type timetableHourRowDTO struct {
+	Hour        int                 `json:"hour"`
+	DisplayHour int                 `json:"display_hour"`
+	Departures  []timetableEntryDTO `json:"departures"`
+}
+
+type timetableDayDTO struct {
+	ServiceID   string                `json:"service_id"`
+	Label       string                `json:"label"`
+	ShortLabel  string                `json:"short_label"`
+	ActiveToday bool                  `json:"active_today"`
+	Hours       []timetableHourRowDTO `json:"hours"`
+}
+
+type timetableLegendDTO struct {
+	Code        string `json:"code"`
+	Description string `json:"description"`
+}
+
+type rawTimetableDep struct {
+	TripID               string
+	ServiceID            string
+	Headsign             string
+	DestStopName         string
+	DepartureSecs        int
+	WheelchairAccessible bool
+}
+
+// GetRouteTimetable returns direction options, ordered route stops, and a Polish-style
+// "tabliczka przystankowa" departure grid grouped by service day type with variant legend.
+func (h *Handler) GetRouteTimetable(w http.ResponseWriter, r *http.Request) {
+	rawParam := chi.URLParam(r, "routeID")
+	feed, rawID, ok := parseCanonicalID(rawParam)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "routeID must be formatted as '<operator>:<id>'")
+		return
+	}
+
+	var requestedDir *int
+	if rawDir := strings.TrimSpace(r.URL.Query().Get("direction_id")); rawDir != "" {
+		d, err := strconv.Atoi(rawDir)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "direction_id must be an integer")
+			return
+		}
+		requestedDir = &d
+	}
+
+	rawStopParam := strings.TrimSpace(r.URL.Query().Get("stop_id"))
+	requestedRawStop := ""
+	if rawStopParam != "" {
+		if f, sid, ok := parseCanonicalID(rawStopParam); ok {
+			if f != feed {
+				writeError(w, http.StatusBadRequest, "stop_id operator must match route_id operator")
+				return
+			}
+			requestedRawStop = sid
+		} else {
+			requestedRawStop = rawStopParam
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	rt, found, err := h.fetchRouteSummary(ctx, feed, rawID)
+	if err != nil {
+		h.internalErr(w, "get route timetable", err)
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "route not found")
+		return
+	}
+
+	dirRows, err := h.pool.Query(ctx, `
+		SELECT t.direction_id, COALESCE(t.trip_headsign, '') AS headsign, COUNT(*) AS trip_cnt
+		FROM trips t
+		WHERE t.feed = $1 AND t.route_id = $2
+		GROUP BY t.direction_id, COALESCE(t.trip_headsign, '')
+		ORDER BY t.direction_id ASC, trip_cnt DESC, headsign ASC
+	`, feed, rawID)
+	if err != nil {
+		h.internalErr(w, "query route directions", err)
+		return
+	}
+	defer dirRows.Close()
+
+	var directions []routeDirectionDTO
+	dirIndex := make(map[int]int)
+	for dirRows.Next() {
+		var dID, cnt int
+		var hs string
+		if err := dirRows.Scan(&dID, &hs, &cnt); err != nil {
+			h.internalErr(w, "scan route directions", err)
+			return
+		}
+		if idx, exists := dirIndex[dID]; exists {
+			directions[idx].TripCount += cnt
+			if hs != "" && hs != directions[idx].Headsign {
+				directions[idx].VariantHeadsigns = append(directions[idx].VariantHeadsigns, hs)
+			}
+			continue
+		}
+		dirIndex[dID] = len(directions)
+		directions = append(directions, routeDirectionDTO{
+			DirectionID: dID,
+			Headsign:    hs,
+			TripCount:   cnt,
+		})
+	}
+	if err := dirRows.Err(); err != nil {
+		h.internalErr(w, "rows route directions", err)
+		return
+	}
+
+	if len(directions) == 0 {
+		setCacheControl(w, 300)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"route":              rt,
+			"directions":         []routeDirectionDTO{},
+			"stops":              []timetableRouteStopDTO{},
+			"active_service_ids": []string{},
+			"day_types":          []timetableDayDTO{},
+			"legend":             []timetableLegendDTO{},
+		})
+		return
+	}
+
+	selectedDir := directions[0].DirectionID
+	if requestedDir != nil {
+		if _, exists := dirIndex[*requestedDir]; !exists {
+			writeError(w, http.StatusNotFound, "direction_id not found for route")
+			return
+		}
+		selectedDir = *requestedDir
+	}
+
+	// Ordered stops from the longest representative trip in the selected direction, plus any branch stops.
+	stopRows, err := h.pool.Query(ctx, `
+		WITH longest AS (
+			SELECT t.trip_id
+			FROM trips t
+			JOIN stop_times st ON st.feed = t.feed AND st.trip_id = t.trip_id
+			WHERE t.feed = $1 AND t.route_id = $2 AND t.direction_id = $3
+			GROUP BY t.trip_id
+			ORDER BY COUNT(*) DESC, t.trip_id ASC
+			LIMIT 1
+		),
+		backbone AS (
+			SELECT st.stop_sequence, st.stop_id,
+			       NOT (st.pickup_type <> 1 AND EXISTS (
+			           SELECT 1 FROM stop_times nx
+			           WHERE nx.feed = st.feed AND nx.trip_id = st.trip_id AND nx.stop_sequence > st.stop_sequence
+			       )) AS is_terminus
+			FROM longest l
+			JOIN stop_times st ON st.feed = $1 AND st.trip_id = l.trip_id
+		),
+		all_dir_stops AS (
+			SELECT st.stop_id,
+			       MIN(st.stop_sequence) AS min_seq,
+			       NOT BOOL_OR(st.pickup_type <> 1 AND EXISTS (
+			           SELECT 1 FROM stop_times nx
+			           WHERE nx.feed = st.feed AND nx.trip_id = st.trip_id AND nx.stop_sequence > st.stop_sequence
+			       )) AS is_terminus
+			FROM trips t
+			JOIN stop_times st ON st.feed = t.feed AND st.trip_id = t.trip_id
+			WHERE t.feed = $1 AND t.route_id = $2 AND t.direction_id = $3
+			GROUP BY st.stop_id
+		)
+		SELECT COALESCE(b.stop_sequence, 100000 + ads.min_seq) AS sort_seq,
+		       ads.stop_id, COALESCE(s.group_id, ''), s.stop_name, s.platform_code,
+		       s.is_on_demand, ads.is_terminus, s.stop_lat, s.stop_lon
+		FROM all_dir_stops ads
+		LEFT JOIN backbone b ON b.stop_id = ads.stop_id
+		JOIN stops s ON s.feed = $1 AND s.stop_id = ads.stop_id
+		ORDER BY (b.stop_sequence IS NULL) ASC, sort_seq ASC, ads.stop_id ASC
+	`, feed, rawID, selectedDir)
+	if err != nil {
+		h.internalErr(w, "query direction stops", err)
+		return
+	}
+	defer stopRows.Close()
+
+	stops := make([]timetableRouteStopDTO, 0)
+	stopByRawID := make(map[string]timetableRouteStopDTO)
+	for stopRows.Next() {
+		var st timetableRouteStopDTO
+		var rawSID string
+		if err := stopRows.Scan(
+			&st.StopSequence, &rawSID, &st.GroupID, &st.Name, &st.PlatformCode,
+			&st.IsOnDemand, &st.IsTerminus, &st.Lat, &st.Lon,
+		); err != nil {
+			h.internalErr(w, "scan direction stops", err)
+			return
+		}
+		st.StopSequence = len(stops) + 1
+		st.StopID = feed + ":" + rawSID
+		stops = append(stops, st)
+		stopByRawID[rawSID] = st
+	}
+	if err := stopRows.Err(); err != nil {
+		h.internalErr(w, "rows direction stops", err)
+		return
+	}
+
+	var selectedStop *timetableRouteStopDTO
+	if requestedRawStop != "" {
+		st, ok := stopByRawID[requestedRawStop]
+		if !ok {
+			writeError(w, http.StatusNotFound, "stop_id not found on selected route direction")
+			return
+		}
+		selectedStop = &st
+	} else if len(stops) > 0 {
+		pick := stops[0]
+		for _, st := range stops {
+			if !st.IsTerminus {
+				pick = st
+				break
+			}
+		}
+		selectedStop = &pick
+		requestedRawStop = strings.TrimPrefix(pick.StopID, feed+":")
+	}
+
+	today := time.Now().In(h.loc).Format("2006-01-02")
+	activeRows, err := h.pool.Query(ctx, `
+		SELECT service_id
+		FROM calendar_dates
+		WHERE feed = $1 AND service_date = $2::date AND exception_type = 1
+	`, feed, today)
+	if err != nil {
+		h.internalErr(w, "query active service ids", err)
+		return
+	}
+	defer activeRows.Close()
+
+	activeSet := make(map[string]bool)
+	activeList := make([]string, 0, 4)
+	for activeRows.Next() {
+		var sid string
+		if err := activeRows.Scan(&sid); err != nil {
+			h.internalErr(w, "scan active service ids", err)
+			return
+		}
+		if !activeSet[sid] {
+			activeSet[sid] = true
+			activeList = append(activeList, sid)
+		}
+	}
+	if err := activeRows.Err(); err != nil {
+		h.internalErr(w, "rows active service ids", err)
+		return
+	}
+
+	var rawDeps []rawTimetableDep
+	if requestedRawStop != "" {
+		depRows, err := h.pool.Query(ctx, `
+			SELECT t.trip_id, t.service_id, COALESCE(t.trip_headsign, ''),
+			       COALESCE(last_s.stop_name, ''), st.departure_secs, t.wheelchair_accessible
+			FROM trips t
+			JOIN stop_times st ON st.feed = t.feed AND st.trip_id = t.trip_id
+			JOIN LATERAL (
+				SELECT s2.stop_name
+				FROM stop_times st2
+				JOIN stops s2 ON s2.feed = st2.feed AND s2.stop_id = st2.stop_id
+				WHERE st2.feed = t.feed AND st2.trip_id = t.trip_id
+				ORDER BY st2.stop_sequence DESC
+				LIMIT 1
+			) last_s ON true
+			WHERE t.feed = $1 AND t.route_id = $2 AND t.direction_id = $3
+			  AND st.stop_id = $4
+			  AND st.pickup_type <> 1
+			  AND EXISTS (
+			      SELECT 1 FROM stop_times nx
+			      WHERE nx.feed = st.feed AND nx.trip_id = st.trip_id AND nx.stop_sequence > st.stop_sequence
+			  )
+			ORDER BY st.departure_secs ASC, t.trip_id ASC
+		`, feed, rawID, selectedDir, requestedRawStop)
+		if err != nil {
+			h.internalErr(w, "query timetable departures", err)
+			return
+		}
+		defer depRows.Close()
+
+		for depRows.Next() {
+			var d rawTimetableDep
+			var rawTID string
+			var wheelchair int
+			if err := depRows.Scan(&rawTID, &d.ServiceID, &d.Headsign, &d.DestStopName, &d.DepartureSecs, &wheelchair); err != nil {
+				h.internalErr(w, "scan timetable departures", err)
+				return
+			}
+			d.TripID = feed + ":" + rawTID
+			d.WheelchairAccessible = wheelchair == 1
+			rawDeps = append(rawDeps, d)
+		}
+		if err := depRows.Err(); err != nil {
+			h.internalErr(w, "rows timetable departures", err)
+			return
+		}
+	}
+
+	dayTypes, legend := buildRouteTimetableDays(rawDeps, activeSet)
+
+	setCacheControl(w, 300)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"route":                 rt,
+		"directions":            directions,
+		"selected_direction_id": selectedDir,
+		"stops":                 stops,
+		"selected_stop":         selectedStop,
+		"active_service_ids":    activeList,
+		"day_types":             dayTypes,
+		"legend":                legend,
+	})
+}
+
+func buildRouteTimetableDays(deps []rawTimetableDep, activeSet map[string]bool) ([]timetableDayDTO, []timetableLegendDTO) {
+	if len(deps) == 0 {
+		return []timetableDayDTO{}, []timetableLegendDTO{}
+	}
+
+	type variantKey struct {
+		headsign string
+		dest     string
+	}
+	variantCounts := make(map[variantKey]int)
+	hasPW := false
+	servicesSeen := make(map[string]bool)
+	for _, d := range deps {
+		variantCounts[variantKey{headsign: d.Headsign, dest: d.DestStopName}]++
+		servicesSeen[d.ServiceID] = true
+		if d.ServiceID == "PW" {
+			hasPW = true
+		}
+	}
+
+	// Primary variant has the highest frequency (tie-broken lexicographically).
+	var primary variantKey
+	maxCnt := -1
+	for k, cnt := range variantCounts {
+		if cnt > maxCnt || (cnt == maxCnt && (k.headsign < primary.headsign || (k.headsign == primary.headsign && k.dest < primary.dest))) {
+			maxCnt = cnt
+			primary = k
+		}
+	}
+
+	var nonPrimary []variantKey
+	for k := range variantCounts {
+		if k != primary {
+			nonPrimary = append(nonPrimary, k)
+		}
+	}
+	sort.Slice(nonPrimary, func(i, j int) bool {
+		ci, cj := variantCounts[nonPrimary[i]], variantCounts[nonPrimary[j]]
+		if ci != cj {
+			return ci > cj
+		}
+		if nonPrimary[i].headsign != nonPrimary[j].headsign {
+			return nonPrimary[i].headsign < nonPrimary[j].headsign
+		}
+		return nonPrimary[i].dest < nonPrimary[j].dest
+	})
+
+	variantCodeByKey := make(map[variantKey]string, len(nonPrimary))
+	legend := make([]timetableLegendDTO, 0, len(nonPrimary))
+	for idx, k := range nonPrimary {
+		var code string
+		if idx < 26 {
+			code = string(rune('A' + idx))
+		} else {
+			code = fmt.Sprintf("V%d", idx+1)
+		}
+		variantCodeByKey[k] = code
+		desc := k.headsign
+		if desc == "" {
+			desc = k.dest
+		}
+		if k.dest != "" && !strings.EqualFold(desc, k.dest) {
+			desc = fmt.Sprintf("Kurs do: %s (przystanek końcowy: %s)", desc, k.dest)
+		} else if desc != "" {
+			desc = "Kurs do: " + desc
+		} else {
+			desc = "Wariant trasy"
+		}
+		legend = append(legend, timetableLegendDTO{
+			Code:        code,
+			Description: desc,
+		})
+	}
+
+	byServiceHour := make(map[string]map[int][]timetableEntryDTO, len(servicesSeen))
+	for _, d := range deps {
+		hr := d.DepartureSecs / 3600
+		min := (d.DepartureSecs % 3600) / 60
+		dispHr := hr % 24
+		if byServiceHour[d.ServiceID] == nil {
+			byServiceHour[d.ServiceID] = make(map[int][]timetableEntryDTO)
+		}
+		code := variantCodeByKey[variantKey{headsign: d.Headsign, dest: d.DestStopName}]
+		byServiceHour[d.ServiceID][hr] = append(byServiceHour[d.ServiceID][hr], timetableEntryDTO{
+			TripID:               d.TripID,
+			Hour:                 hr,
+			DisplayHour:          dispHr,
+			Minute:               min,
+			Time:                 fmt.Sprintf("%02d:%02d", dispHr, min),
+			VariantCode:          code,
+			Headsign:             d.Headsign,
+			WheelchairAccessible: d.WheelchairAccessible,
+		})
+	}
+
+	serviceIDs := make([]string, 0, len(servicesSeen))
+	for sid := range servicesSeen {
+		serviceIDs = append(serviceIDs, sid)
+	}
+	sort.Slice(serviceIDs, func(i, j int) bool {
+		_, _, oi := describeServiceID(serviceIDs[i], hasPW)
+		_, _, oj := describeServiceID(serviceIDs[j], hasPW)
+		if oi != oj {
+			return oi < oj
+		}
+		return serviceIDs[i] < serviceIDs[j]
+	})
+
+	dayTypes := make([]timetableDayDTO, 0, len(serviceIDs))
+	for _, sid := range serviceIDs {
+		label, shortLabel, _ := describeServiceID(sid, hasPW)
+		hourMap := byServiceHour[sid]
+		hours := make([]int, 0, len(hourMap))
+		for hr := range hourMap {
+			hours = append(hours, hr)
+		}
+		sort.Ints(hours)
+
+		hourRows := make([]timetableHourRowDTO, 0, len(hours))
+		for _, hr := range hours {
+			entries := hourMap[hr]
+			sort.Slice(entries, func(i, j int) bool {
+				if entries[i].Minute != entries[j].Minute {
+					return entries[i].Minute < entries[j].Minute
+				}
+				return entries[i].TripID < entries[j].TripID
+			})
+			hourRows = append(hourRows, timetableHourRowDTO{
+				Hour:        hr,
+				DisplayHour: hr % 24,
+				Departures:  entries,
+			})
+		}
+		dayTypes = append(dayTypes, timetableDayDTO{
+			ServiceID:   sid,
+			Label:       label,
+			ShortLabel:  shortLabel,
+			ActiveToday: activeSet[sid],
+			Hours:       hourRows,
+		})
+	}
+	return dayTypes, legend
+}
+
+func describeServiceID(serviceID string, hasPW bool) (label, shortLabel string, order int) {
+	switch strings.ToUpper(strings.TrimSpace(serviceID)) {
+	case "PS":
+		if hasPW {
+			return "Dni robocze (nauka szkolna)", "Rob. szkolne", 1
+		}
+		return "Dni robocze", "Robocze", 1
+	case "PW":
+		return "Dni robocze (ferie / wakacje)", "Rob. wolne", 2
+	case "SS":
+		return "Soboty", "Sobota", 3
+	case "NS":
+		return "Niedziele i święta", "Niedz. / Św.", 4
+	default:
+		return serviceID, serviceID, 9
+	}
+}
+
 // GetTrip returns trip metadata, ordered stop calls with live estimates, active vehicle, and optional shape.
 func (h *Handler) GetTrip(w http.ResponseWriter, r *http.Request) {
 	rawParam := chi.URLParam(r, "tripID")
@@ -943,6 +1664,19 @@ func (h *Handler) GetTrip(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		writeError(w, http.StatusBadRequest, "tripID must be formatted as '<operator>:<id>'")
 		return
+	}
+
+	now := time.Now().In(h.loc)
+	nowUTC := now.UTC()
+
+	var explicitServiceDate *time.Time
+	if rawSvcDate := strings.TrimSpace(r.URL.Query().Get("service_date")); rawSvcDate != "" {
+		parsedDate, err := time.ParseInLocation("2006-01-02", rawSvcDate, h.loc)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "service_date must be formatted as YYYY-MM-DD")
+			return
+		}
+		explicitServiceDate = &parsedDate
 	}
 
 	includeShape := r.URL.Query().Get("include_shape") == "true"
@@ -978,7 +1712,8 @@ func (h *Handler) GetTrip(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.pool.Query(ctx, `
 		SELECT st.stop_sequence, st.stop_id, COALESCE(s.group_id, ''), s.stop_name,
 		       s.platform_code, s.is_on_demand, s.stop_lat, s.stop_lon,
-		       st.arrival_secs, st.departure_secs
+		       st.arrival_secs, st.departure_secs,
+		       st.pickup_type, st.drop_off_type, st.shape_dist_traveled
 		FROM stop_times st
 		JOIN stops s ON s.feed = st.feed AND s.stop_id = st.stop_id
 		WHERE st.feed = $1 AND st.trip_id = $2
@@ -990,70 +1725,114 @@ func (h *Handler) GetTrip(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	now := time.Now().In(h.loc)
-	nowUTC := now.UTC()
-	noon := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, h.loc)
-	origin := noon.Add(-12 * time.Hour)
-
-	type tripStopDTO struct {
-		StopSequence       int       `json:"stop_sequence"`
-		StopID             string    `json:"stop_id"`
-		GroupID            string    `json:"group_id"`
-		StopName           string    `json:"stop_name"`
-		PlatformCode       string    `json:"platform_code,omitempty"`
-		IsOnDemand         bool      `json:"is_on_demand"`
-		Lat                float64   `json:"lat"`
-		Lon                float64   `json:"lon"`
-		ScheduledArrival   string    `json:"scheduled_arrival"`
-		ScheduledDeparture string    `json:"scheduled_departure"`
-		EstimatedDeparture time.Time `json:"estimated_departure"`
-		DelaySeconds       *int      `json:"delay_seconds"`
-		IsRealtime         bool      `json:"is_realtime"`
-		Skipped            bool      `json:"skipped"`
+	type rawTripStop struct {
+		stopSeq           int
+		rawSID            string
+		groupID           string
+		stopName          string
+		platformCode      string
+		isOnDemand        bool
+		lat               float64
+		lon               float64
+		arrSecs           int
+		depSecs           int
+		pickupType        int
+		dropOffType       int
+		shapeDistTraveled *float64
 	}
 
-	stops := make([]tripStopDTO, 0)
+	rawStops := make([]rawTripStop, 0)
+	maxDepSecs := 0
 	for rows.Next() {
-		var s tripStopDTO
-		var rawSID string
-		var arrSecs, depSecs int
+		var rs rawTripStop
 		if err := rows.Scan(
-			&s.StopSequence, &rawSID, &s.GroupID, &s.StopName,
-			&s.PlatformCode, &s.IsOnDemand, &s.Lat, &s.Lon,
-			&arrSecs, &depSecs,
+			&rs.stopSeq, &rs.rawSID, &rs.groupID, &rs.stopName,
+			&rs.platformCode, &rs.isOnDemand, &rs.lat, &rs.lon,
+			&rs.arrSecs, &rs.depSecs,
+			&rs.pickupType, &rs.dropOffType, &rs.shapeDistTraveled,
 		); err != nil {
 			h.internalErr(w, "scan trip stops", err)
 			return
 		}
-		s.StopID = feed + ":" + rawSID
-		s.ScheduledArrival = formatGTFSSeconds(arrSecs)
-		s.ScheduledDeparture = formatGTFSSeconds(depSecs)
-
-		sched := origin.Add(time.Duration(depSecs) * time.Second)
-		est := h.rtStore.EstimateDeparture(feed, rawID, s.StopSequence, rawSID, sched, nowUTC)
-		s.EstimatedDeparture = est.EstimatedTime
-		s.DelaySeconds = est.DelaySeconds
-		s.IsRealtime = est.IsRealtime
-		s.Skipped = est.Skipped
-		stops = append(stops, s)
+		if rs.depSecs > maxDepSecs {
+			maxDepSecs = rs.depSecs
+		}
+		rawStops = append(rawStops, rs)
 	}
 	if err := rows.Err(); err != nil {
 		h.internalErr(w, "rows trip stops", err)
 		return
 	}
 
-	var activeVehicle *gtfsrt.Vehicle
-	vehicles, _ := h.rtStore.Vehicles(feed, "", nil, nowUTC)
-	for i := range vehicles {
-		if vehicles[i].TripID == rawParam {
-			activeVehicle = &vehicles[i]
-			break
-		}
+	serviceDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, h.loc)
+	if explicitServiceDate != nil {
+		serviceDate = *explicitServiceDate
+	} else if now.Hour() < 6 && maxDepSecs >= 24*3600 {
+		// Night courses extending past midnight belong to yesterday's service day until 06:00.
+		serviceDate = serviceDate.AddDate(0, 0, -1)
 	}
+	noon := time.Date(serviceDate.Year(), serviceDate.Month(), serviceDate.Day(), 12, 0, 0, 0, h.loc)
+	origin := noon.Add(-12 * time.Hour)
+
+	type tripStopDTO struct {
+		StopSequence           int       `json:"stop_sequence"`
+		StopID                 string    `json:"stop_id"`
+		GroupID                string    `json:"group_id"`
+		StopName               string    `json:"stop_name"`
+		PlatformCode           string    `json:"platform_code,omitempty"`
+		IsOnDemand             bool      `json:"is_on_demand"`
+		Lat                    float64   `json:"lat"`
+		Lon                    float64   `json:"lon"`
+		PickupType             int       `json:"pickup_type"`
+		DropOffType            int       `json:"drop_off_type"`
+		ShapeDistTraveled      *float64  `json:"shape_dist_traveled,omitempty"`
+		ScheduledArrival       string    `json:"scheduled_arrival"`
+		ScheduledDeparture     string    `json:"scheduled_departure"`
+		ScheduledArrivalTime   time.Time `json:"scheduled_arrival_time"`
+		ScheduledDepartureTime time.Time `json:"scheduled_departure_time"`
+		EstimatedArrival       time.Time `json:"estimated_arrival"`
+		EstimatedDeparture     time.Time `json:"estimated_departure"`
+		DelaySeconds           *int      `json:"delay_seconds"`
+		IsRealtime             bool      `json:"is_realtime"`
+		Skipped                bool      `json:"skipped"`
+	}
+
+	stops := make([]tripStopDTO, 0, len(rawStops))
+	for _, rs := range rawStops {
+		schedArr := origin.Add(time.Duration(rs.arrSecs) * time.Second)
+		schedDep := origin.Add(time.Duration(rs.depSecs) * time.Second)
+		est := h.rtStore.EstimateDeparture(feed, rawID, rs.stopSeq, rs.rawSID, schedDep, nowUTC)
+		delayOffset := est.EstimatedTime.Sub(schedDep)
+
+		stops = append(stops, tripStopDTO{
+			StopSequence:           rs.stopSeq,
+			StopID:                 feed + ":" + rs.rawSID,
+			GroupID:                rs.groupID,
+			StopName:               rs.stopName,
+			PlatformCode:           rs.platformCode,
+			IsOnDemand:             rs.isOnDemand,
+			Lat:                    rs.lat,
+			Lon:                    rs.lon,
+			PickupType:             rs.pickupType,
+			DropOffType:            rs.dropOffType,
+			ShapeDistTraveled:      rs.shapeDistTraveled,
+			ScheduledArrival:       formatGTFSSeconds(rs.arrSecs),
+			ScheduledDeparture:     formatGTFSSeconds(rs.depSecs),
+			ScheduledArrivalTime:   schedArr,
+			ScheduledDepartureTime: schedDep,
+			EstimatedArrival:       schedArr.Add(delayOffset),
+			EstimatedDeparture:     est.EstimatedTime,
+			DelaySeconds:           est.DelaySeconds,
+			IsRealtime:             est.IsRealtime,
+			Skipped:                est.Skipped,
+		})
+	}
+
+	activeVehicle := h.rtStore.VehicleByTrip(feed, rawID, nowUTC)
 
 	resp := map[string]any{
 		"trip": map[string]any{
-			"id":                    rawParam,
+			"id":                    feed + ":" + rawID,
 			"operator":              feed,
 			"route_id":              feed + ":" + routeID,
 			"route_short_name":      routeShort,
@@ -1064,6 +1843,8 @@ func (h *Handler) GetTrip(w http.ResponseWriter, r *http.Request) {
 			"brigade":               brigade,
 			"wheelchair_accessible": wheelchair == 1,
 			"shape_id":              conditionalPrefixed(feed, shapeID),
+			"service_date":          serviceDate.Format("2006-01-02"),
+			"has_live_location":     activeVehicle != nil,
 		},
 		"vehicle": activeVehicle,
 		"stops":   stops,
@@ -1122,7 +1903,7 @@ func (h *Handler) GetShape(w http.ResponseWriter, r *http.Request) {
 
 	setCacheControl(w, 3600)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":          rawParam,
+		"id":          feed + ":" + rawID,
 		"operator":    feed,
 		"point_count": count,
 		"points":      pts,
@@ -1249,6 +2030,9 @@ func (h *Handler) internalErr(w http.ResponseWriter, op string, err error) {
 }
 
 func parseCanonicalID(s string) (feed, rawID string, ok bool) {
+	if decoded, err := url.PathUnescape(s); err == nil {
+		s = decoded
+	}
 	feed, rawID, ok = strings.Cut(strings.TrimSpace(s), ":")
 	if !ok || rawID == "" || (feed != "ztm" && feed != "pks") {
 		return "", "", false
